@@ -8,7 +8,7 @@ from discord.ext.commands.core import Command, command
 
 import youtube_dl
 
-
+import random
 import asyncio
 import os
 
@@ -68,9 +68,10 @@ class Disco(commands.Cog):
 
         self.tasks = []
 
-        self._current = 'Сейчас ничего не играет'
 
-        self.current_playing_track: str = "" #  трек, который играет сейчас
+        self.source: FFmpegPCMAudio = None
+
+        self.current_playing_track: str = "Сейчас ничего не играет" #  трек, который играет сейчас
 
         self.voice_client: VoiceClient = None
         self.ctx: commands.Context = None
@@ -80,10 +81,12 @@ class Disco(commands.Cog):
     async def join(self, ctx: commands.Context):
         """Joins a voice channel """
 
+        audio: list = os.listdir(start_path + '/audio')
+
         author: Member = ctx.message.author
         channel: VoiceChannel = ctx.author.voice.channel
         self.voice_client = await channel.connect()
-        self.voice_client.play(FFmpegPCMAudio(executable='ffmpeg', source=start_path + '/audio/connected.mp3'), after=None)
+        self.voice_client.play(FFmpegPCMAudio(executable='ffmpeg', source=start_path + f'/audio/{random.choice(audio)}'), after=None)
 
     @commands.command()
     async def leave(self, ctx: commands.Context):
@@ -98,37 +101,62 @@ class Disco(commands.Cog):
             self.track_position = 0
 
     @commands.command()
-    async def play(self, ctx: commands.Context, *, url: str):
+    async def play(self, ctx: commands.Context, url: str = None):
         """add to the play queue or reproduce now if the queue is empty"""
         
         if ctx.voice_client is None:
             self.voice_client = await ctx.author.voice.channel.connect()
 
-        async with ctx.typing():
-            with youtube_dl.YoutubeDL(ytdl_format_options) as ydl:
-                info: dict = ydl.extract_info(url, download=False)
-                duration: int = info.get("duration")
+        if self.voice_client.is_paused() and url is None:
+            self.voice_client.play(self.source)
+            await ctx.send(f'Сейчас играет: {self.current_playing_track}')
+
+        with youtube_dl.YoutubeDL(ytdl_format_options) as ydl:
+            info: dict = ydl.extract_info(url, download=False)
+
+            # playlist 
+            entries: list = info.get('entries')
+            if entries is not None:
+                for i, song in enumerate(entries):
+                    title: str = song.get('title')
+                    self.tasks.append((song.get('url'), title))
+                    await ctx.send(f"Добавлено в очередь: {title}, номер в очереди: {len(self.tasks)}")
+            else:
                 title: str = info.get('title')
                 audio_url: str = info.get('url')
-
-                if self.voice_client.is_playing() is False and len(self.tasks) == 0:
-                    self.voice_client.play(FFmpegPCMAudio(executable='ffmpeg', source=audio_url), after=lambda x=None: self.check_queue(ctx))
-                    await ctx.send(f"Проигрывается: {title}, номер в очереди: 0")
-                    self.current_playing_track = title
-                else: 
-                    self.tasks.append((audio_url, title))
-                    await ctx.send(f"Добавлено в очередь: {title}, номер в очереди: {len(self.tasks)}")
+                self.tasks.append((audio_url, title))
+                await ctx.send(f"Добавлено в очередь: {title}, номер в очереди: {len(self.tasks)}")
+            
+            if self.voice_client.is_playing() is False and self.voice_client.is_paused() is False:
+                self.current_playing_track = self.tasks[0][1]
+                self.source = FFmpegPCMAudio(executable='ffmpeg', source=self.tasks.pop(0)[0], **FFMPEG_OPTS)
+                self.voice_client.play(self.source, after=lambda x=None: self.check_queue(ctx))
+                await ctx.send(f'Сейчас играет: {self.current_playing_track}')
 
     @commands.command()
     async def next(self, ctx: commands.Context):
         """Go to the next track"""
+        
+        if self.voice_client.is_paused():
+            self.voice_client.resume()
+        
         self.voice_client.stop()
+
+    @commands.command()
+    async def pause(self, ctx: commands.Context):
+        """Pauses a track"""
+
+        self.voice_client.pause()
+        await ctx.send(f'Поставлен на паузу: {self.current_playing_track}')
 
     @commands.command()
     async def queue(self, ctx: commands.Context):
         """Displays the play queue list"""
 
-        await ctx.send(''.join([f'Позиция: {i + 1}, трек: ' + x[1] + "\n" for i, x in enumerate(self.tasks)]))
+        if len(self.tasks) > 0:
+            await ctx.send(''.join([f'Позиция: {i + 1}, трек: ' + x[1] + "\n" for i, x in enumerate(self.tasks)]))
+        else:
+            await ctx.send('В очереди нет треков')
 
     @commands.command()
     async def current(self, ctx: commands.Context):
@@ -147,7 +175,8 @@ class Disco(commands.Cog):
             self.voice_client = await channel.connect()
 
             self.current_playing_track = self.tasks[pos][1]
-            self.voice_client.play(FFmpegPCMAudio(executable='ffmpeg', source=self.tasks.pop(pos)[0]), after=lambda x=None: self.check_queue(ctx))
+            self.source = FFmpegPCMAudio(executable='ffmpeg', source=self.tasks.pop(0)[0], **FFMPEG_OPTS)
+            self.voice_client.play(self.source, after=lambda x=None: self.check_queue(ctx))
 
             await ctx.send(f'Сейчас играет: {self.current_playing_track}')
         else:
@@ -156,7 +185,8 @@ class Disco(commands.Cog):
     def check_queue(self, ctx: commands.Context):
         if len(self.tasks) > 0 and self.voice_client.is_connected():
             title: str = self.tasks[0][1]
-            ctx.voice_client.play(FFmpegPCMAudio(executable='ffmpeg', source=self.tasks.pop(0)[0], **FFMPEG_OPTS), after=lambda x=None: self.check_queue(ctx))
+            self.source = FFmpegPCMAudio(executable='ffmpeg', source=self.tasks.pop(0)[0], **FFMPEG_OPTS)
+            ctx.voice_client.play(self.source, after=lambda x=None: self.check_queue(ctx))
             self.bot.loop.create_task(ctx.send(f"Проигрывается: {title}"))
             self.current_playing_track = title
 
