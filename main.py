@@ -1,14 +1,16 @@
-from http.server import executable
 import discord
-from discord import voice_client
+import sys
+from discord.channel import VoiceChannel
 
-from discord.ext import commands
-from discord import VoiceClient, AudioSource, FFmpegPCMAudio
+from discord.ext import commands, tasks
+from discord import VoiceClient, FFmpegPCMAudio, Member
+from discord.ext.commands.core import Command, command
 
 import youtube_dl
-import os
 
-#client = discord.Client()
+
+import asyncio
+import os
 
 bot = commands.Bot(command_prefix='--')
 
@@ -16,75 +18,166 @@ start_path: str = os.path.abspath(os.path.dirname(__file__))
 ffmpeg_path: str = os.path.normpath(os.path.join(start_path, 'ffmpeg/win64/bin/'))
 outtmpl: str = os.path.normpath(os.path.join(start_path, 'downloads/audio'))
 
-ydl_opts = {'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192'
-            }],
-            'ffmpeg_location': ffmpeg_path,
-            'outtmpl': outtmpl
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0' # bind to ipv4 since ipv6 addresses cause issues sometimes
 }
-# with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-#     ydl.download(['http://www.youtube.com/watch?v=BaW_jenozKc'])
 
-# @client.event
-# async def on_ready():
-#     print('We have logged in as {0.user}'.format(client))
+FFMPEG_OPTS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': '-vn'}
 
-# @client.event
-# async def on_message(message):
-#     if message.author == client.user:
-#         return
-
-#     if message.content.startswith('--play'):
-#         voice = VoiceClient(client, "Сериальчики")
-#         await voice.connect(timeout=10, reconnect=True)
-
-#         await client.voice_clients.
-#         #await message.channel.send('денис любит дашу @sdd!')
+ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
 
 
-@bot.command(pass_context=True)
-async def on_message(message):
-    if message.author == bot.user:
-        return
 
-    print(message)
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
 
+        self.data = data
 
-@bot.command(name='join')
-async def join(ctx):
-    author = ctx.message.author
-    channel = ctx.author.voice.channel
-    await channel.connect()
+        self.title = data.get('title')
+        self.url = data.get('url')
 
-@bot.command(name='stop')
-async def leave(ctx):
-    if ctx.message.guild.voice_client.is_connected():
-        await ctx.voice_client.disconnect()
-    else:
-        await ctx.send('The bot is not connected to a voice channel')
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
 
-@bot.command(name='play')
-async def play(ctx: commands.Context, url: str):
-    servername: str = ctx.message.guild
-    voice_channel = ctx.author.voice.channel
+        if 'entries' in data:
+            # take first item from a playlist
+            data = data['entries'][0]
+
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename, **FFMPEG_OPTS), data=data)
 
 
-    channel = ctx.author.voice.channel
+class Disco(commands.Cog):
+    def __init__(self, bot) -> None:
+        self.bot: commands.Bot = bot
 
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+        self.queue = []
 
-    voice_client: VoiceClient = await channel.connect()
-    audio_source: FFmpegPCMAudio = FFmpegPCMAudio(executable=os.path.normpath(os.path.join(ffmpeg_path, 'ffmpeg.exe')), 
-        source=os.path.normpath(os.path.join(start_path, 'downloads/audio.mp3')))
-    voice_client.play(source=audio_source, after=None)
-    
+        self.tasks = []
 
-# @play.error
-# async def play_error(ctx: commands.Context, error: commands.CommandError, ):
-#     if isinstance(error, commands.MissingRequiredArgument):
-#         await ctx.send("Please, specify url adress")
+        self._current = 'Сейчас ничего не играет'
 
-bot.run('ODg5NDk1NTk4ODEyNzcwMzU2.YUiFVA.gbUO2j-ZBuCEViC14CRw6l28iuU')
+        self.current_playing_track: str = "" #  трек, который играет сейчас
+
+        self.voice_client: VoiceClient = None
+        self.ctx: commands.Context = None
+
+
+    @commands.command()
+    async def join(self, ctx: commands.Context):
+        """Joins a voice channel """
+
+        author: Member = ctx.message.author
+        channel: VoiceChannel = ctx.author.voice.channel
+        self.voice_client = await channel.connect()
+        self.voice_client.play(FFmpegPCMAudio(executable='ffmpeg', source=start_path + '/audio/connected.mp3'), after=None)
+
+    @commands.command()
+    async def leave(self, ctx: commands.Context):
+        """Leave a voice channel"""
+
+        voice_client: VoiceClient = ctx.voice_client
+        if voice_client is None:
+            await ctx.send('The bot is not connected to a voice channel')
+        else:
+            await ctx.voice_client.disconnect()
+            self.tasks.clear()
+            self.track_position = 0
+
+    @commands.command()
+    async def play(self, ctx: commands.Context, *, url: str):
+        """add to the play queue or reproduce now if the queue is empty"""
+        
+        if ctx.voice_client is None:
+            self.voice_client = await ctx.author.voice.channel.connect()
+
+        async with ctx.typing():
+            with youtube_dl.YoutubeDL(ytdl_format_options) as ydl:
+                info: dict = ydl.extract_info(url, download=False)
+                duration: int = info.get("duration")
+                title: str = info.get('title')
+                audio_url: str = info.get('url')
+
+                if self.voice_client.is_playing() is False and len(self.tasks) == 0:
+                    self.voice_client.play(FFmpegPCMAudio(executable='ffmpeg', source=audio_url), after=lambda x=None: self.check_queue(ctx))
+                    await ctx.send(f"Проигрывается: {title}, номер в очереди: 0")
+                    self.current_playing_track = title
+                else: 
+                    self.tasks.append((audio_url, title))
+                    await ctx.send(f"Добавлено в очередь: {title}, номер в очереди: {len(self.tasks)}")
+
+    @commands.command()
+    async def next(self, ctx: commands.Context):
+        """Go to the next track"""
+        self.voice_client.stop()
+
+    @commands.command()
+    async def queue(self, ctx: commands.Context):
+        """Displays the play queue list"""
+
+        await ctx.send(''.join([f'Позиция: {i + 1}, трек: ' + x[1] + "\n" for i, x in enumerate(self.tasks)]))
+
+    @commands.command()
+    async def current(self, ctx: commands.Context):
+        """what song is playing now"""
+
+        await ctx.send(f'Сейчас играет: {self.current_playing_track}')
+
+    @commands.command()
+    async def goto(self, ctx: commands.Context, pos: int):
+        """Jump to position, tell the queue number"""
+
+        pos = pos - 1
+        if 0 <= pos < len(self.tasks):
+            await self.voice_client.disconnect()
+            channel: VoiceChannel = ctx.author.voice.channel
+            self.voice_client = await channel.connect()
+
+            self.current_playing_track = self.tasks[pos][1]
+            self.voice_client.play(FFmpegPCMAudio(executable='ffmpeg', source=self.tasks.pop(pos)[0]), after=lambda x=None: self.check_queue(ctx))
+
+            await ctx.send(f'Сейчас играет: {self.current_playing_track}')
+        else:
+            await ctx.send(f'Позиция не найдена!')
+
+    def check_queue(self, ctx: commands.Context):
+        if len(self.tasks) > 0 and self.voice_client.is_connected():
+            title: str = self.tasks[0][1]
+            ctx.voice_client.play(FFmpegPCMAudio(executable='ffmpeg', source=self.tasks.pop(0)[0], **FFMPEG_OPTS), after=lambda x=None: self.check_queue(ctx))
+            self.bot.loop.create_task(ctx.send(f"Проигрывается: {title}"))
+            self.current_playing_track = title
+
+
+if __name__ == "__main__":
+
+    token_path: str = None
+    token: str = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--token":
+            token = sys.argv[i + 1]
+        if arg == "--filetoken":
+            token_path = sys.argv[i + 1]
+
+    if token is None:
+        if token_path is None:
+            print("[DISCO] - Please, specify token after --token keyword, or file with token after --tokenfile keyword")
+            sys.exit(1)
+        with open(start_path + f"/{token_path}", "r", encoding="utf-8") as file:
+            token = file.read()
+
+    bot = commands.Bot(command_prefix='-', description='Disco bot')
+    bot.add_cog(Disco(bot))
+    bot.run(token)
