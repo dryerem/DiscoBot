@@ -1,8 +1,10 @@
 # python 
 /venv
 yotube_playlist.py
+__pycache__
 
 # config files
 token_test_disco.txt
 token_disco.txt
 yo.txt
+config.ini

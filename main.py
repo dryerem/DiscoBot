@@ -12,6 +12,10 @@ import random
 import asyncio
 import os
 
+import pafy
+
+import youtube_playlist as pl
+
 bot = commands.Bot(command_prefix='--')
 
 start_path: str = os.path.abspath(os.path.dirname(__file__))
@@ -61,8 +65,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
 
 class Disco(commands.Cog):
-    def __init__(self, bot) -> None:
+    def __init__(self, bot, youtube_token: str) -> None:
         self.bot: commands.Bot = bot
+        self._youtube_token = youtube_token
 
         self.queue = []
 
@@ -110,28 +115,24 @@ class Disco(commands.Cog):
         if self.voice_client.is_paused() and url is None:
             self.voice_client.play(self.source)
             await ctx.send(f'Сейчас играет: {self.current_playing_track}')
+        
+        if 'list=' in url:
+            playlist: list = pl.playlist_parse(url, token=self._youtube_token)
+            self.tasks.extend(playlist)
+        else:
+            with youtube_dl.YoutubeDL(ytdl_format_options) as ydl:
+                info: dict = ydl.extract_info(url, download=False)
 
-        with youtube_dl.YoutubeDL(ytdl_format_options) as ydl:
-            info: dict = ydl.extract_info(url, download=False)
+            title: str = info.get('title')
+            audio_url: str = info.get('url')
+            self.tasks.append((audio_url, title))
+            await ctx.send(f"Добавлено в очередь: {title}, номер в очереди: {len(self.tasks)}")            
 
-            # playlist 
-            entries: list = info.get('entries')
-            if entries is not None:
-                for i, song in enumerate(entries):
-                    title: str = song.get('title')
-                    self.tasks.append((song.get('url'), title))
-                    await ctx.send(f"Добавлено в очередь: {title}, номер в очереди: {len(self.tasks)}")
-            else:
-                title: str = info.get('title')
-                audio_url: str = info.get('url')
-                self.tasks.append((audio_url, title))
-                await ctx.send(f"Добавлено в очередь: {title}, номер в очереди: {len(self.tasks)}")
-            
-            if self.voice_client.is_playing() is False and self.voice_client.is_paused() is False:
-                self.current_playing_track = self.tasks[0][1]
-                self.source = FFmpegPCMAudio(executable='ffmpeg', source=self.tasks.pop(0)[0], **FFMPEG_OPTS)
-                self.voice_client.play(self.source, after=lambda x=None: self.check_queue(ctx))
-                await ctx.send(f'Сейчас играет: {self.current_playing_track}')
+        if self.voice_client.is_playing() is False and self.voice_client.is_paused() is False:
+            self.current_playing_track = self.tasks[0][1]
+            self.source = FFmpegPCMAudio(executable='ffmpeg', source=self.tasks.pop(0)[0], **FFMPEG_OPTS)
+            self.voice_client.play(self.source, after=lambda x=None: self.check_queue(ctx))
+            await ctx.send(f'Сейчас играет: {self.current_playing_track}')
 
     @commands.command()
     async def next(self, ctx: commands.Context):
@@ -193,21 +194,34 @@ class Disco(commands.Cog):
 
 if __name__ == "__main__":
 
-    token_path: str = None
-    token: str = None
-    for i, arg in enumerate(sys.argv):
-        if arg == "--token":
-            token = sys.argv[i + 1]
-        if arg == "--filetoken":
-            token_path = sys.argv[i + 1]
+    from configparser import ConfigParser
+    from sys import argv, exit
+    from os import path
 
-    if token is None:
-        if token_path is None:
-            print("[DISCO] - Please, specify token after --token keyword, or file with token after --tokenfile keyword")
-            sys.exit(1)
-        with open(start_path + f"/{token_path}", "r", encoding="utf-8") as file:
-            token = file.read()
+    file_config: str = None
+    for iter, arg in enumerate(argv):
+        if arg == '--config':
+            file_config = argv[iter + 1]
+    
+    config: ConfigParser = ConfigParser()
+    if file_config:
+        if path.isfile(file_config):
+            config.read(file_config)
+        else:
+            print("File config not found!")
+            exit(1)
+    else:
+        start_path: str = path.abspath(path.dirname(__file__))
+        file_config = path.normpath(path.join(start_path, 'config.ini'))
+        if path.isfile(file_config):
+            config.read(file_config)
+        else:
+            print("File config not found!")
+            exit(1)
+
+    discord_token: str = config['Discord']['token']
+    youtube_token: str = config['Youtube']['token']
 
     bot = commands.Bot(command_prefix='-', description='Disco bot')
-    bot.add_cog(Disco(bot))
-    bot.run(token)
+    bot.add_cog(Disco(bot, youtube_token))
+    bot.run(discord_token)
